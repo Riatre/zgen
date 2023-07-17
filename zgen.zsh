@@ -133,7 +133,7 @@ zgen-clone() {
 
     if [[ ! -d "${dir}" ]]; then
         mkdir -p "${dir}"
-        git init --initial-branch dummy "${dir}"
+        git init "${dir}"
         git -C "${dir}" remote add origin "${url}"
         git -C "${dir}" fetch --depth 1 origin "${branch}"
         git -C "${dir}" checkout --recurse-submodules FETCH_HEAD
