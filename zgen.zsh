@@ -44,6 +44,14 @@ if [[ -z "${ZGEN_COMPLETIONS}" ]]; then
     ZGEN_COMPLETIONS=()
 fi
 
+if [[ -z "${ZGEN_PENDING_CLONES}" ]]; then
+    ZGEN_PENDING_CLONES=()
+fi
+
+if [[ -z "${ZGEN_PENDING_LOADS}" ]]; then
+    ZGEN_PENDING_LOADS=()
+fi
+
 if [[ -z "${ZGEN_USE_PREZTO}" ]]; then
     ZGEN_USE_PREZTO=0
 fi
@@ -128,15 +136,127 @@ fi
 zgen-clone() {
     local repo="${1}"
     local branch="${2:-master}"
+    local background="${3:-false}"
     local url="$(-zgen-get-clone-url ${repo})"
     local dir="$(-zgen-get-clone-dir ${repo} ${branch})"
 
     if [[ ! -d "${dir}" ]]; then
-        mkdir -p "${dir}"
-        git init "${dir}"
-        git -C "${dir}" remote add origin "${url}"
-        git -C "${dir}" fetch --depth 1 origin "${branch}"
-        git -C "${dir}" checkout --recurse-submodules FETCH_HEAD
+        if [[ "${background}" == "true" ]]; then
+            # Run clone in background and return job PID
+            (
+                mkdir -p "${dir}"
+                git init "${dir}"
+                git -C "${dir}" remote add origin "${url}"
+                git -C "${dir}" fetch --depth 1 origin "${branch}"
+                git -C "${dir}" checkout --recurse-submodules FETCH_HEAD
+            ) &
+            local job_pid=$!
+            ZGEN_PENDING_CLONES+=("${job_pid}")
+            return 0
+        else
+            # Original synchronous behavior
+            mkdir -p "${dir}"
+            git init "${dir}"
+            git -C "${dir}" remote add origin "${url}"
+            git -C "${dir}" fetch --depth 1 origin "${branch}"
+            git -C "${dir}" checkout --recurse-submodules FETCH_HEAD
+        fi
+    fi
+}
+
+-zgen-wait-for-clones() {
+    local job_pid
+    local failed_jobs=()
+    
+    if [[ ${#ZGEN_PENDING_CLONES[@]} -gt 0 ]]; then
+        -zgpute "Waiting for ${#ZGEN_PENDING_CLONES[@]} background clone operations to complete..."
+        
+        for job_pid in "${ZGEN_PENDING_CLONES[@]}"; do
+            if ! wait "${job_pid}"; then
+                failed_jobs+=("${job_pid}")
+            fi
+        done
+        
+        if [[ ${#failed_jobs[@]} -gt 0 ]]; then
+            -zgpute "Warning: ${#failed_jobs[@]} clone operations failed"
+        fi
+        
+        # Clear the pending clones array
+        ZGEN_PENDING_CLONES=()
+    fi
+}
+
+-zgen-process-pending-loads() {
+    local load_args
+    
+    if [[ ${#ZGEN_PENDING_LOADS[@]} -gt 0 ]]; then
+        -zgpute "Processing ${#ZGEN_PENDING_LOADS[@]} queued plugin loads..."
+        
+        for load_args in "${ZGEN_PENDING_LOADS[@]}"; do
+            # Execute the delayed load operation
+            eval "-zgen-load-plugin ${load_args}"
+        done
+        
+        # Clear the pending loads array
+        ZGEN_PENDING_LOADS=()
+    fi
+    
+    # Execute any pending Prezto module loads after plugins are loaded
+    if [[ ${#ZGEN_PREZTO_LOAD[@]} -gt 0 ]]; then
+        -zgpute "Processing ${#ZGEN_PREZTO_LOAD[@]} queued Prezto modules..."
+        
+        for params in "${ZGEN_PREZTO_LOAD[@]}"; do
+            local cmd="pmodload ${params}"
+            eval $cmd
+        done
+    fi
+}
+
+-zgen-load-plugin() {
+    local location="${1}"
+    local dir="${2}"
+    local file="${3}"
+    
+    # source the file
+    if [[ -f "${location}" ]]; then
+        -zgen-source "${location}"
+
+    # Prezto modules have init.zsh files
+    elif [[ -f "${location}/init.zsh" ]]; then
+        -zgen-source "${location}/init.zsh"
+
+    elif [[ -f "${location}.zsh-theme" ]]; then
+        -zgen-source "${location}.zsh-theme"
+
+    elif [[ -f "${location}.theme.zsh" ]]; then
+        -zgen-source "${location}.theme.zsh"
+
+    elif [[ -f "${location}.zshplugin" ]]; then
+        -zgen-source "${location}.zshplugin"
+
+    elif [[ -f "${location}.zsh.plugin" ]]; then
+        -zgen-source "${location}.zsh.plugin"
+
+    # Classic oh-my-zsh plugins have foo.plugin.zsh
+    elif -zgen-path-contains "${location}" ".plugin.zsh" ; then
+        for script (${location}/*\.plugin\.zsh(N)) -zgen-source "${script}"
+
+    elif -zgen-path-contains "${location}" ".zsh" ; then
+        for script (${location}/*\.zsh(N)) -zgen-source "${script}"
+
+    elif -zgen-path-contains "${location}" ".sh" ; then
+        for script (${location}/*\.sh(N)) -zgen-source "${script}"
+
+    # Completions
+    elif [[ -d "${location}" ]]; then
+        -zgen-add-to-fpath "${location}"
+
+    else
+      if [[ -d ${dir:-$location} ]]; then
+        -zgpute "Failed to load ${dir:-$location} -- ${file}"
+      else
+        -zgpute "Failed to load ${dir:-$location}"
+      fi
     fi
 }
 
@@ -192,9 +312,7 @@ zgen-clone() {
     local params="$*"
     local cmd="pmodload ${params[@]}"
 
-    # execute in place
-    eval $cmd
-
+    # We run this in `zgen save`.
     if [[ ! "${ZGEN_PREZTO[@]}" =~ "${cmd}" ]]; then
         ZGEN_PREZTO_LOAD+=("${params[@]}")
     fi
@@ -230,6 +348,12 @@ zgen-update() {
 
 zgen-save() {
     -zgpute 'Creating `'"${ZGEN_INIT}"'` ...'
+
+    # Wait for all background clone operations to complete
+    -zgen-wait-for-clones
+    
+    # Process all queued plugin loads
+    -zgen-process-pending-loads
 
     -zgputs "# {{{" >! "${ZGEN_INIT}"
     -zginit "# Generated by zgen."
@@ -332,6 +456,8 @@ zgen-load() {
         -zgpute '`zgen load <repo> [location] [branch]`'
     elif [[ "$#" == 1 && ("${1[1]}" == '/' || "${1[1]}" == '.' ) ]]; then
         local location="${1}"
+        # For local files, load immediately since no cloning is needed
+        -zgen-load-plugin "${location}" "" ""
     else
         local repo="${1}"
         local file="${2}"
@@ -340,52 +466,13 @@ zgen-load() {
         local location="${dir}/${file}"
         location=${location%/}
 
-        # clone repo if not present
+        # clone repo if not present - using background cloning
         if [[ ! -d "${dir}" ]]; then
-            zgen-clone "${repo}" "${branch}"
+            zgen-clone "${repo}" "${branch}" "true"
         fi
-    fi
-
-    # source the file
-    if [[ -f "${location}" ]]; then
-        -zgen-source "${location}"
-
-    # Prezto modules have init.zsh files
-    elif [[ -f "${location}/init.zsh" ]]; then
-        -zgen-source "${location}/init.zsh"
-
-    elif [[ -f "${location}.zsh-theme" ]]; then
-        -zgen-source "${location}.zsh-theme"
-
-    elif [[ -f "${location}.theme.zsh" ]]; then
-        -zgen-source "${location}.theme.zsh"
-
-    elif [[ -f "${location}.zshplugin" ]]; then
-        -zgen-source "${location}.zshplugin"
-
-    elif [[ -f "${location}.zsh.plugin" ]]; then
-        -zgen-source "${location}.zsh.plugin"
-
-    # Classic oh-my-zsh plugins have foo.plugin.zsh
-    elif -zgen-path-contains "${location}" ".plugin.zsh" ; then
-        for script (${location}/*\.plugin\.zsh(N)) -zgen-source "${script}"
-
-    elif -zgen-path-contains "${location}" ".zsh" ; then
-        for script (${location}/*\.zsh(N)) -zgen-source "${script}"
-
-    elif -zgen-path-contains "${location}" ".sh" ; then
-        for script (${location}/*\.sh(N)) -zgen-source "${script}"
-
-    # Completions
-    elif [[ -d "${location}" ]]; then
-        -zgen-add-to-fpath "${location}"
-
-    else
-      if [[ -d ${dir:-$location} ]]; then
-        -zgpute "Failed to load ${dir:-$location} -- ${file}"
-      else
-        -zgpute "Failed to load ${dir:-$location}"
-      fi
+        
+        # Queue the plugin loading for later processing
+        ZGEN_PENDING_LOADS+=("\"${location}\" \"${dir}\" \"${file}\"")
     fi
 }
 
@@ -471,9 +558,9 @@ zgen-pmodule() {
 
     local dir="$(-zgen-get-clone-dir ${repo} ${branch})"
 
-    # clone repo if not present
+    # clone repo if not present - using background cloning
     if [[ ! -d "${dir}" ]]; then
-        zgen-clone "${repo}" "${branch}"
+        zgen-clone "${repo}" "${branch}" "true"
     fi
 
     local module="${repo:t}"
